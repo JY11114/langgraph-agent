@@ -1,0 +1,15 @@
+anthropic
+langchain
+langchain-anthropic
+langchain-community
+langchain-text-splitters
+langchain-huggingface
+langgraph
+crewai
+mcp
+duckduckgo-search
+chromadb
+sentence-transformers
+rank-bm25
+jieba
+akshare
