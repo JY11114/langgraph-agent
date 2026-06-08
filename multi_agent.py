@@ -1,124 +1,164 @@
 """
-基于 CrewAI 的多 Agent 金融分析系统
+CrewAI 多 Agent 协作系统
 
 角色分工：
-  researcher  — 网络搜索，收集实时新闻与市场数据
-  rag_analyst — 检索本地金融研报知识库，提取专业观点
-  advisor     — 综合两路信息，输出投资分析结论
+  researcher  — 网络搜索，获取实时市场动态
+  rag_analyst — 研报知识库检索，提供专业研究观点
+  advisor     — 综合两路输出，生成投资分析报告
+
+顺序流程：researcher → rag_analyst → advisor（context 共享）
 """
 
-import os
 import sys
-sys.path.append(os.path.dirname(__file__))
+import os
+sys.path.insert(0, os.path.dirname(__file__))
 
 from crewai import Agent, Task, Crew, Process
-from crewai.tools import BaseTool
-from pydantic import Field
-from langchain_community.tools import DuckDuckGoSearchRun
+from crewai.tools import tool as crewai_tool
+from langchain_anthropic import ChatAnthropic
+from core.config import Config
 from service.rag_service import RAGService
+from langchain_community.tools import DuckDuckGoSearchRun
 
-# ── 工具封装（CrewAI 要求继承 BaseTool）─────────────────────
-
-class WebSearchTool(BaseTool):
-    name: str = "web_search"
-    description: str = "搜索互联网实时信息，适用于最新新闻、市场动态、公司公告等。输入搜索关键词。"
-
-    def _run(self, query: str) -> str:
-        return DuckDuckGoSearchRun().run(query)
+# ── 工具 ──────────────────────────────────────────────────────
+_search = DuckDuckGoSearchRun()
+_rag: RAGService | None = None
 
 
-class RAGSearchTool(BaseTool):
-    name: str = "rag_search"
-    description: str = "检索本地金融研报知识库，适用于行业分析、券商观点、研究报告等专业内容。输入查询问题。"
-    _rag: RAGService = None
-
-    def model_post_init(self, __context):
-        self._rag = RAGService()
-
-    def _run(self, query: str) -> str:
-        try:
-            return self._rag.chat(query)
-        except Exception as e:
-            return f"知识库查询失败：{e}"
+def _get_rag() -> RAGService:
+    global _rag
+    if _rag is None:
+        _rag = RAGService()
+    return _rag
 
 
-# ── Agent 定义 ────────────────────────────────────────────────
+@crewai_tool("网络搜索")
+def web_search(query: str) -> str:
+    """搜索互联网实时信息，适用于新闻、市场动态、最新价格等内容。"""
+    try:
+        return _search.run(query)
+    except Exception as e:
+        return f"搜索失败：{e}"
 
+
+@crewai_tool("研报知识库检索")
+def search_knowledge_base(query: str) -> str:
+    """
+    检索本地金融研报知识库，获取券商专业分析观点。
+    知识库涵盖：宁德时代、贵州茅台、比亚迪深度研报及新能源行业策略报告。
+    """
+    try:
+        return _get_rag().chat(query)
+    except Exception as e:
+        return f"知识库查询失败：{e}"
+
+
+# ── LLM ──────────────────────────────────────────────────────
+llm = ChatAnthropic(
+    model=Config.MODEL_NAME,
+    api_key=Config.ANTHROPIC_API_KEY,
+    max_tokens=Config.MAX_TOKENS,
+)
+
+# ── Agents ────────────────────────────────────────────────────
 researcher = Agent(
-    role="金融研究员",
-    goal="通过网络搜索收集关于目标公司或行业的最新新闻、财务数据和市场动态",
-    backstory="你是一位经验丰富的金融信息收集专家，擅长从互联网快速定位高价值信息。",
-    tools=[WebSearchTool()],
+    role="市场研究员",
+    goal="通过网络搜索获取目标公司或行业的最新市场动态、新闻及实时数据",
+    backstory=(
+        "你是一名专注 A 股市场的资深研究员，擅长通过互联网快速收集"
+        "最新市场信息、政策动向与行业动态，为后续专业分析提供实时数据支撑。"
+    ),
+    tools=[web_search],
+    llm=llm,
     verbose=True,
-    allow_delegation=False,
 )
 
 rag_analyst = Agent(
     role="研报分析师",
-    goal="从本地金融研报知识库中检索相关专业分析，提取券商观点和行业洞察",
-    backstory="你是专注于研读券商研报的分析师，熟悉从专业文献中提炼核心投资逻辑。",
-    tools=[RAGSearchTool()],
+    goal="从本地研报知识库中检索专业分析观点，结合券商数据给出深度研究结论",
+    backstory=(
+        "你是一名专业的卖方研究分析师，深度研究过宁德时代、贵州茅台、比亚迪等"
+        "头部公司及新能源行业，擅长从机构研报中提取核心投资逻辑与估值依据。"
+    ),
+    tools=[search_knowledge_base],
+    llm=llm,
     verbose=True,
-    allow_delegation=False,
 )
 
 advisor = Agent(
     role="投资顾问",
-    goal="综合网络信息与研报观点，给出结构化的投资分析结论",
-    backstory="你是资深投资顾问，擅长整合多源信息并输出逻辑清晰、有据可查的投资建议。",
+    goal="综合市场实时信息与研报专业观点，输出结构化投资分析报告",
+    backstory=(
+        "你是一名经验丰富的投资顾问，善于整合多来源信息，在充分权衡风险与收益后"
+        "给出客观、有据可查的投资建议，报告风格清晰、逻辑严谨。"
+    ),
     tools=[],
+    llm=llm,
     verbose=True,
-    allow_delegation=False,
 )
 
 
-# ── 任务定义 ──────────────────────────────────────────────────
-
-def build_crew(question: str) -> Crew:
-    t1 = Task(
-        description=f"针对问题「{question}」，搜索互联网，收集最新相关新闻、数据和市场动态，整理成结构化摘要。",
-        expected_output="包含来源的要点列表，覆盖最新动态、关键数据和市场情绪。",
+# ── 构建 Crew ─────────────────────────────────────────────────
+def build_crew(topic: str) -> Crew:
+    task_research = Task(
+        description=(
+            f"针对「{topic}」，通过网络搜索收集最新市场动态、近期新闻、"
+            "实时价格走势及宏观政策相关信息，整理成简明摘要供后续分析使用。"
+        ),
+        expected_output="200 字以内的市场动态摘要，包含关键数据点和信息来源。",
         agent=researcher,
     )
 
-    t2 = Task(
-        description=f"针对问题「{question}」，检索本地研报知识库，提取相关的专业分析、券商评级和行业观点。",
-        expected_output="来自研报的专业观点摘要，包含具体数据或结论。",
+    task_rag = Task(
+        description=(
+            f"针对「{topic}」，检索本地券商研报知识库，提取机构对该标的的"
+            "核心投资逻辑、财务数据、目标价及风险提示，给出专业研究结论。"
+        ),
+        expected_output="300 字以内的研报观点摘要，包含关键财务指标与投资评级。",
         agent=rag_analyst,
     )
 
-    t3 = Task(
+    task_advise = Task(
         description=(
-            f"基于研究员收集的实时信息和研报分析师提取的专业观点，"
-            f"对问题「{question}」给出综合投资分析报告。"
-            f"报告需包含：核心结论、支撑依据、潜在风险。"
+            f"基于市场研究员提供的实时动态和研报分析师的专业观点，"
+            f"针对「{topic}」撰写一份综合投资分析报告。"
+            "报告须包含：市场现状、基本面分析、风险提示、综合建议四部分。"
         ),
-        expected_output="结构化投资分析报告，含结论、依据和风险提示，字数 300 字以上。",
+        expected_output="结构清晰的投资分析报告，分节呈现，结尾给出明确的综合建议。",
         agent=advisor,
-        context=[t1, t2],
+        context=[task_research, task_rag],
     )
 
     return Crew(
         agents=[researcher, rag_analyst, advisor],
-        tasks=[t1, t2, t3],
+        tasks=[task_research, task_rag, task_advise],
         process=Process.sequential,
         verbose=True,
     )
 
 
-# ── 入口 ──────────────────────────────────────────────────────
-
+# ── CLI 入口 ──────────────────────────────────────────────────
 if __name__ == "__main__":
-    questions = [
-        "宁德时代近期值得投资吗",
-        "新能源行业2026年的投资机会在哪里",
-    ]
+    print("CrewAI 多 Agent 金融投资分析系统")
+    print("输入 exit 退出")
+    print("=" * 60)
 
-    for q in questions:
-        print("\n" + "=" * 60)
-        print(f"问题：{q}")
-        print("=" * 60)
-        crew = build_crew(q)
+    while True:
+        try:
+            topic = input("\n请输入分析标的（如：宁德时代、新能源行业）：").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n已退出。")
+            break
+        if not topic:
+            continue
+        if topic.lower() in ("exit", "quit", "退出"):
+            print("已退出。")
+            break
+
+        print(f"\n正在启动多 Agent 协作分析「{topic}」...\n")
+        crew = build_crew(topic)
         result = crew.kickoff()
-        print("\n最终报告：")
+        print("\n" + "=" * 60)
+        print("【最终投资分析报告】")
+        print("=" * 60)
         print(result)

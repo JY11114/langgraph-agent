@@ -1,8 +1,8 @@
-# 基于 LangGraph 的任务型 AI Agent
+# langgraph-agent
 
-面向金融投研场景的多框架 AI Agent 系统，覆盖 LangGraph 状态图执行闭环、LangChain Tool-Calling Agent、CrewAI 多 Agent 分工协作、MCP 协议服务接入与双层记忆机制，研报 RAG 检索封装为可被多种 Agent 框架复用的独立工具。
+金融研报分析 Agent，本地 RAG 检索 + CrewAI 联网搜索两路召回，LangGraph 状态图控制执行流程，LLM 质量打分驱动重试。另有 CrewAI 多角色协作版本和 MCP Server 供 Claude Desktop 接入。
 
-**技术栈**：Python · LangGraph · LangChain · CrewAI · ChromaDB · FastMCP · Claude API
+**技术栈**：Python、LangGraph、LangChain、CrewAI、MCP、Tool Calling、ChromaDB、Claude API
 
 ## 系统架构
 
@@ -10,29 +10,35 @@
 ┌─────────────────────────────────────────────────────────────┐
 │                  Tool-Calling Agent（agent.py）              │
 │                                                             │
-│  用户提问 ─→ 长期记忆检索注入 System Prompt                   │
-│  LLM 意图识别 → 工具路由（自动选择以下工具）                   │
+│  用户提问 → 长期记忆检索注入 System Prompt                    │
+│  LLM 意图识别 → 工具路由                                     │
 │    ├── search_knowledge_base  本地研报 RAG 检索               │
 │    ├── web_search             实时互联网搜索                  │
 │    ├── get_stock_price        A 股实时行情                    │
 │    ├── calculate_financial_metrics  PE/市值/增长率计算        │
 │    ├── save_to_memory         写入长期记忆                    │
 │    └── recall_from_memory     检索历史记忆                    │
-│  ← RunnableWithMessageHistory 短期上下文管理                 │
+│  ← MemorySaver 短期上下文管理                                │
 │  ← ChromaDB 长期记忆持久化（会话结束自动摘要存储）             │
 └─────────────────────────────────────────────────────────────┘
 
-┌──────────────────────────────────────────┐
-│     LangGraph 状态图（langgraph_basic.py）│
-│                                          │
-│  search_node（RAG 检索）                  │
-│      │                                   │
-│   should_retry（条件边）                  │
-│      ├── 结果不足 → 重新检索（最多3次）    │
-│      └── 充分 → analysis_node（LLM 分析）│
-│                    │                     │
-│                   END                   │
-└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│     LangGraph 状态图（langgraph_basic.py）                 │
+│                                                          │
+│  rag_search（向量+BM25+RRF+Reranker 混合检索）             │
+│      │                                                   │
+│  web_search（CrewAI Agent + DuckDuckGo）                 │
+│      │                                                   │
+│   should_retry（条件边）                                  │
+│      ├── 召回不足 → rag_search（最多重试 3 次）             │
+│      └── 充分 → analysis（LLM 综合分析）                  │
+│                    │                                     │
+│              quality_check（LLM 对结果打分 1-10）         │
+│                    │                                     │
+│               should_redo（条件边）                       │
+│                    ├── 分数<6 → analysis（最多重做 2 次）  │
+│                    └── 达标 → save_memory → END          │
+└──────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────┐
 │       CrewAI 多 Agent（multi_agent.py）   │
@@ -46,34 +52,26 @@
 mcp_server.py → FastMCP 标准协议（Claude Desktop 可直接接入）
 ```
 
-## 核心功能
+## 模块说明
 
-### 任务规划与执行闭环
-基于 LangGraph 设计状态图驱动的执行流程，`StateGraph` 定义 `search → should_retry → analysis` 有向路径，条件边负责结果反思与重试（最多 3 次），实现任务分解、执行、反思、重试的闭环控制，完整状态可追踪可扩展。
+### langgraph_basic.py
+LangGraph 状态图主文件。五个节点：`rag_search`→`web_search`→`analysis`→`quality_check`→`save_memory`，两条条件边分别控制搜索重试和分析重做。RAG 用向量+BM25+RRF 混合检索后 Reranker 精排，联网搜索由 CrewAI Agent 驱动。质量达标后把本次分析结论写入长期记忆。
 
-### 多 Agent 分工协作
-CrewAI 多角色架构：研究员（网络搜索）、研报分析师（RAG 检索）、投资顾问（综合输出），三者顺序协作并共享 context，主控 Agent 负责最终分析综合，避免单一 Agent 信息盲区。
+### agent.py
+Tool-Calling Agent，直接把 6 个工具挂给 LLM，MemorySaver 管短期上下文，ChromaDB 持久化长期记忆。每次问答前把相关历史记忆拼入消息前缀，会话满 4 条后自动提炼摘要写入。
 
-### 自定义工具体系
-将研报检索、网络搜索、A 股行情、金融计算（EPS×PE 目标价、增长率、市值）封装为 LangChain `@tool`，Tool-Calling Agent 通过 LLM 意图识别自动选择并路由，工具可被多种 Agent 框架（LangGraph / CrewAI / MCP）复用调用。
+### multi_agent.py
+CrewAI 版本。researcher/rag_analyst/advisor 三角色顺序执行，context 共享，最终由 advisor 汇总成投资分析报告。
 
-### MCP 协议接入
-基于 FastMCP 实现标准 MCP 服务端，将 `search_knowledge_base`、`get_stock_price`、`web_search` 暴露为 MCP 工具，Claude Desktop 等主流 AI 工具无需额外开发即可直接接入本地知识库。
-
-### 记忆系统
-双层记忆设计：
-- **短期记忆**：`RunnableWithMessageHistory` 维护单次会话完整上下文，支持跨轮引用上文信息
-- **长期记忆**：ChromaDB 持久化存储，会话结束后自动摘要并写入；下次对话启动时语义检索相关历史，注入 System Prompt，跨会话延续关键结论
-
-### RAG 工具集成
-混合检索（ChromaDB 向量 + BM25 + RRF 融合）+ CrossEncoder Reranker 精排，封装为独立 LangChain Tool，可被 Tool-Calling Agent、CrewAI 各角色、LangGraph 节点统一调用。
+### mcp_server.py
+FastMCP 封装，暴露三个工具（知识库检索、股价查询、联网搜索），Claude Desktop 通过 stdio 接入。
 
 ## 项目结构
 
 ```
 langgraph-agent/
 ├── agent.py               # Tool-Calling Agent（6 工具 · 短期+长期记忆）
-├── langgraph_basic.py     # LangGraph 状态图（搜索→条件重试→分析）
+├── langgraph_basic.py     # LangGraph 状态图（RAG+联网→分析→质量控制）
 ├── multi_agent.py         # CrewAI 多 Agent（研究员/分析师/顾问）
 ├── mcp_server.py          # MCP Server（FastMCP · Claude Desktop 接入）
 ├── tools/
@@ -102,22 +100,20 @@ langgraph-agent/
 ## 快速开始
 
 ```bash
-# 安装依赖
 pip install -r requirements.txt
 
-# 配置 API Key
 export ANTHROPIC_API_KEY=your_key_here
 
-# Tool-Calling Agent（多工具 + 记忆系统演示）
+# Tool-Calling Agent（多工具 + 记忆系统）
 python agent.py
 
-# LangGraph 状态图（执行闭环 + 重试演示）
+# LangGraph 状态图（执行闭环 + 重试）
 python langgraph_basic.py
 
 # CrewAI 多 Agent 协作
 python multi_agent.py
 
-# MCP Server（供 Claude Desktop 等工具接入）
+# MCP Server
 python mcp_server.py
 ```
 
@@ -138,8 +134,8 @@ python mcp_server.py
 用户：宁德时代2024年Q3毛利率是多少？储能业务增速如何？
 助手：[调用 search_knowledge_base]
      根据华泰证券研报（2024-10-15）：
-     • Q3 毛利率 26.3%，创近八季度新高
-     • 储能电池出货 62GWh，同比增长 42%
+     · Q3 毛利率 26.3%，创近八季度新高
+     · 储能电池出货 62GWh，同比增长 42%
 
 用户：基于研报数据，帮我算一下宁德时代按 EPS=12.8、PE=16.5 的目标价
 助手：[调用 calculate_financial_metrics]
@@ -150,29 +146,28 @@ python mcp_server.py
      已保存：宁德时代目标价 211.2 元（EPS=12.8，PE=16.5）
 ```
 
-## 记忆系统设计
+## 记忆系统
 
 ```python
-# 短期记忆：RunnableWithMessageHistory 维护会话上下文
-agent_with_history = RunnableWithMessageHistory(executor, get_session_history, ...)
+# 短期记忆：MemorySaver 维护会话上下文
+_agent = create_agent(llm, tools, checkpointer=MemorySaver())
 
 # 长期记忆：ChromaDB 持久化
 class LongTermMemory:
     def save(self, content: str, session_id: str, category: str) -> str
-    def recall(self, query: str, top_k: int = 3) -> list[str]      # 语义相似检索
-    def summarize_and_save(self, session_id, history, llm) -> str   # 会话结束自动摘要
+    def recall(self, query: str, top_k: int = 3) -> list[str]
+    def summarize_and_save(self, session_id, history, llm) -> str
 
-# 对话启动时：检索长期记忆注入 System Prompt
+# 启动时检索长期记忆注入提示词前缀
 memories = _long_term_memory.recall(question, top_k=3)
-# 对话结束时：自动摘要写入（≥4 条消息触发）
-_long_term_memory.summarize_and_save(session_id, history_dicts, llm)
+# 会话满 4 条后自动摘要写入
+_long_term_memory.summarize_and_save(session_id, history_dicts, _llm_client)
 ```
 
 ## MCP 接入
 
 ```python
-# mcp_server.py — 标准 MCP 工具暴露
-mcp = FastMCP("financial-agent")
+mcp = FastMCP("financial-tools")
 
 @mcp.tool()
 def search_knowledge_base(query: str) -> str: ...
@@ -184,8 +179,15 @@ def get_stock_price(stock_code: str) -> str: ...
 def web_search(query: str) -> str: ...
 ```
 
-在 Claude Desktop 的 MCP 配置中添加本服务后，即可直接调用以上工具，无需额外开发。
-# langgraph-agent
-# langgraph-agent
-# financial-rag-qa
-# langgraph-agent
+Claude Desktop 配置（`claude_desktop_config.json`）：
+
+```json
+{
+  "mcpServers": {
+    "financial-tools": {
+      "command": "python",
+      "args": ["/path/to/mcp_server.py"]
+    }
+  }
+}
+```

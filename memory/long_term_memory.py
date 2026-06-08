@@ -78,7 +78,6 @@ class LongTermMemory:
             if len(line) > 5:
                 self.save(line, session_id=session_id, category="session_summary")
 
-        print(f"[长期记忆] 已保存 {len(summary.strip().split(chr(10)))} 条会话摘要")
         return summary
 
     def count(self) -> int:
